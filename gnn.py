@@ -7,21 +7,18 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 from typing import List, Tuple, Dict, Sequence, Any
-import inspect
 
 
 class AdjacencyList:
     """represent the topology of a graph"""
-    def __init__(self, node_num: int, adj_list: List[Tuple], use_cuda: bool = False):
+    def __init__(self, node_num: int, adj_list: List, device: torch.device):
         self.node_num = node_num
+        self.data = torch.tensor(adj_list, dtype=torch.long, device=device)
         self.edge_num = len(adj_list)
-        self.use_cuda = use_cuda
-        data = (torch.cuda if use_cuda else torch).LongTensor(self.edge_num, 2).zero_()
-        for row_id, (node_s, node_t) in enumerate(adj_list):
-            data[row_id, 0] = node_s
-            data[row_id, 1] = node_t
 
-        self.data = Variable(data)
+    @property
+    def device(self):
+        return self.data.device
 
     def __getitem__(self, item):
         return self.data[item]
@@ -29,16 +26,20 @@ class AdjacencyList:
 
 class GatedGraphNeuralNetwork(nn.Module):
     def __init__(self, hidden_size, num_edge_types, layer_timesteps,
-                 residual_connections, state_to_message_dropout=0.3,
+                 residual_connections,
+                 state_to_message_dropout=0.3,
                  rnn_dropout=0.3,
-                 use_cuda=False):
-        local_vars = locals()
-        arg_spec = inspect.getfullargspec(self.__init__)
-        for arg_name in filter(lambda x: x != 'self', arg_spec.args):
-            print('%s: %s' % (arg_name, local_vars[arg_name]))
-            self.__dict__[arg_name] = local_vars[arg_name]
+                 use_bias_for_message_linear=True):
 
         super(GatedGraphNeuralNetwork, self).__init__()
+
+        self.hidden_size = hidden_size
+        self.num_edge_types = num_edge_types
+        self.layer_timesteps = layer_timesteps
+        self.residual_connections = residual_connections
+        self.state_to_message_dropout = state_to_message_dropout
+        self.rnn_dropout = rnn_dropout
+        self.use_bias_for_message_linear = use_bias_for_message_linear
 
         # Prepare linear transformations from node states to messages, for each layer and each edge type
         # Prepare rnn cells for each layer
@@ -49,7 +50,7 @@ class GatedGraphNeuralNetwork(nn.Module):
             # Initiate a linear transformation for each edge type
             for edge_type_j in range(self.num_edge_types):
                 # TODO: glorot_init?
-                state_to_msg_linear_layer_i_type_j = nn.Linear(self.hidden_size, self.hidden_size)
+                state_to_msg_linear_layer_i_type_j = nn.Linear(self.hidden_size, self.hidden_size, bias=use_bias_for_message_linear)
                 setattr(self,
                         'state_to_message_linear_layer%d_type%d' % (layer_idx, edge_type_j),
                         state_to_msg_linear_layer_i_type_j)
@@ -65,17 +66,42 @@ class GatedGraphNeuralNetwork(nn.Module):
         self.state_to_message_dropout_layer = nn.Dropout(self.state_to_message_dropout)
         self.rnn_dropout_layer = nn.Dropout(self.rnn_dropout)
 
+    @property
+    def device(self):
+        return self.rnn_cells[0].weight_hh.device
+
     def forward(self,
                 initial_node_representation: Variable,
-                adjacency_lists: List[AdjacencyList]) -> Variable:
-        return self.compute_final_node_representations(initial_node_representation, adjacency_lists)
+                adjacency_lists: List[AdjacencyList],
+                return_all_states=False) -> Variable:
+        return self.compute_node_representations(initial_node_representation, adjacency_lists,
+                                                 return_all_states=return_all_states)
 
-    def compute_final_node_representations(self,
-                                           initial_node_representation: Variable,
-                                           adjacency_lists: List[AdjacencyList]) -> Variable:
+    def compute_node_representations(self,
+                                     initial_node_representation: Variable,
+                                     adjacency_lists: List[AdjacencyList],
+                                     return_all_states=False) -> Variable:
+        # If the dimension of initial node embedding is smaller, then perform padding first
         # one entry per layer (final state of that layer), shape: number of nodes in batch v x D
+        init_node_repr_size = initial_node_representation.size(1)
+        device = adjacency_lists[0].data.device
+        if init_node_repr_size < self.hidden_size:
+            pad_size = self.hidden_size - init_node_repr_size
+            zero_pads = torch.zeros(initial_node_representation.size(0), pad_size, dtype=torch.float, device=device)
+            initial_node_representation = torch.cat([initial_node_representation, zero_pads], dim=-1)
         node_states_per_layer = [initial_node_representation]
 
+        node_num = initial_node_representation.size(0)
+
+        message_targets = []  # list of tensors of message targets of shape [E]
+        for edge_type_idx, adjacency_list_for_edge_type in enumerate(adjacency_lists):
+            if adjacency_list_for_edge_type.edge_num > 0:
+                edge_targets = adjacency_list_for_edge_type[:, 1]
+                message_targets.append(edge_targets)
+        message_targets = torch.cat(message_targets, dim=0)  # Shape [M]
+
+        # sparse matrix of shape [V, M]
+        # incoming_msg_sparse_matrix = self.get_incoming_message_sparse_matrix(adjacency_lists).to(device)
         for layer_idx, num_timesteps in enumerate(self.layer_timesteps):
             # Used shape abbreviations:
             #   V ~ number of nodes
@@ -98,24 +124,28 @@ class GatedGraphNeuralNetwork(nn.Module):
 
                 # Collect incoming messages per edge type
                 for edge_type_idx, adjacency_list_for_edge_type in enumerate(adjacency_lists):
-                    # shape [E]
-                    edge_sources = adjacency_list_for_edge_type[:, 0]
-                    # shape [E, D]
-                    edge_source_states = node_states_for_this_layer[edge_sources]
+                    if adjacency_list_for_edge_type.edge_num > 0:
+                        # shape [E]
+                        edge_sources = adjacency_list_for_edge_type[:, 0]
+                        # shape [E, D]
+                        edge_source_states = node_states_for_this_layer[edge_sources]
 
-                    f_state_to_message = self.state_to_message_linears[layer_idx][edge_type_idx]
-                    # Shape [E, D]
-                    all_messages_for_edge_type = self.state_to_message_dropout_layer(f_state_to_message(edge_source_states))
+                        f_state_to_message = self.state_to_message_linears[layer_idx][edge_type_idx]
+                        # Shape [E, D]
+                        all_messages_for_edge_type = self.state_to_message_dropout_layer(f_state_to_message(edge_source_states))
 
-                    messages.append(all_messages_for_edge_type)
-                    message_source_states.append(edge_source_states)
+                        messages.append(all_messages_for_edge_type)
+                        message_source_states.append(edge_source_states)
 
                 # shape [M, D]
                 messages: torch.FloatTensor = torch.cat(messages, dim=0)
 
                 # Sum up messages that go to the same target node
                 # shape [V, D]
-                incoming_messages = self.get_incoming_message_sparse_matrix(adjacency_lists) @ messages
+                incoming_messages = torch.zeros(node_num, messages.size(1), device=device)
+                incoming_messages = incoming_messages.scatter_add_(0,
+                                                                   message_targets.unsqueeze(-1).expand_as(messages),
+                                                                   messages)
 
                 # shape [V, D * (1 + num of residual connections)]
                 incoming_information = torch.cat(layer_residual_states + [incoming_messages], dim=-1)
@@ -128,36 +158,22 @@ class GatedGraphNeuralNetwork(nn.Module):
 
             node_states_per_layer.append(node_states_for_this_layer)
 
-        node_states_for_last_layer = node_states_per_layer[-1]
-        return node_states_for_last_layer
-
-    def get_incoming_message_sparse_matrix(self, adjacency_lists: List[AdjacencyList]) -> Variable:
-        typed_edge_nums = [adj_list.edge_num for adj_list in adjacency_lists]
-        all_messages_num = sum(typed_edge_nums)
-        node_num = adjacency_lists[0].node_num
-
-        T = torch.cuda if self.use_cuda else torch
-        x = T.FloatTensor(node_num, all_messages_num).zero_()
-
-        for edge_type_idx, adjacency_list_for_edge_type in enumerate(adjacency_lists):
-            # shape [E]
-            target_nodes = adjacency_list_for_edge_type[:, 1]
-            for msg_idx, tgt_node in enumerate(target_nodes.data):
-                msg_offset = sum(typed_edge_nums[:edge_type_idx]) + msg_idx
-                x[tgt_node, msg_offset] = 1
-
-        return Variable(x)
+        if return_all_states:
+            return node_states_per_layer[1:]
+        else:
+            node_states_for_last_layer = node_states_per_layer[-1]
+            return node_states_for_last_layer
 
 
 def main():
     gnn = GatedGraphNeuralNetwork(hidden_size=64, num_edge_types=2,
                                   layer_timesteps=[3, 5, 7, 2], residual_connections={2: [0], 3: [0, 1]})
 
-    adj_list_type1 = AdjacencyList(node_num=4, adj_list=[(0, 2), (2, 1), (1, 3)])
-    adj_list_type2 = AdjacencyList(node_num=4, adj_list=[(0, 0), (0, 1)])
+    adj_list_type1 = AdjacencyList(node_num=4, adj_list=[(0, 2), (2, 1), (1, 3)], device=gnn.device)
+    adj_list_type2 = AdjacencyList(node_num=4, adj_list=[(0, 0), (0, 1)], device=gnn.device)
 
-    node_representations = gnn.compute_final_node_representations(initial_node_representation=Variable(torch.randn(4, 64)),
-                                                                  adjacency_lists=[adj_list_type1, adj_list_type2])
+    node_representations = gnn.compute_node_representations(initial_node_representation=torch.randn(4, 64),
+                                                            adjacency_lists=[adj_list_type1, adj_list_type2])
 
     print(node_representations)
 
